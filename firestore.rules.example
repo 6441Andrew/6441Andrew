@@ -1,0 +1,59 @@
+rules_version = '2';
+// Example production-oriented rules — adapt to your claims / role model.
+// Deploy: firebase deploy --only firestore:rules
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function email() { return request.auth.token.email; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // Public lookup indexes (read by id only)
+    match /staffIds/{id} {
+      allow get: if true;
+      allow list: if false;
+      allow write: if signedIn();
+    }
+    match /studentInvites/{id} {
+      allow get: if true;
+      allow list: if false;
+      allow write: if signedIn();
+    }
+
+    match /hub_submissions/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.user_id == request.auth.uid;
+      allow update: if signedIn();
+      allow delete: if false;
+    }
+
+    match /courses/{id} {
+      allow read: if signedIn();
+      allow create, update, delete: if signedIn();
+    }
+
+    match /lessons/{id} {
+      allow read: if signedIn();
+      allow write: if signedIn();
+    }
+
+    match /hub_exams/{id} {
+      allow read: if signedIn();
+      allow write: if signedIn();
+    }
+
+    match /exam_scores/{id} {
+      allow read: if signedIn();
+      allow write: if signedIn();
+    }
+
+    match /students/{id} {
+      allow read: if signedIn();
+      allow write: if signedIn();
+    }
+
+    match /{document=**} {
+      allow read, write: if signedIn();
+    }
+  }
+}

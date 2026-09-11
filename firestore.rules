@@ -1,0 +1,1052 @@
+rules_version = '2';
+
+// Wonderland Academy ERP — Firestore security rules
+// Deploy: firebase deploy --only firestore:rules
+//
+// Aligned with src/lib/permissions.js + roleMatrix.js
+// Parents: read school data; can create Application Form only
+// Students: Learning Hub via studentAccounts (or users.role == student)
+// Writes enforced by role; UI hides buttons but rules are the real gate
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/users/$(uid());
+    }
+
+    function hasUserDoc() {
+      return isSignedIn() && exists(userPath());
+    }
+
+    function userDoc() {
+      return get(userPath()).data;
+    }
+
+    // Read the role value the same way the client's shapeProfile() does —
+    // tolerating alternate field-name casing (Role / userRole / user_role)
+    // as well as alternate value casing/separators. Previously this only
+    // read the exact lowercase `role` key, so a document saved with a
+    // differently-cased field name looked like a valid super_admin in the
+    // UI (client is lenient) but resolved to role() == '' here (rules were
+    // strict) — every read/write was then denied with permission-denied
+    // even though the account was, in fact, the intended super admin.
+    function rawRole(data) {
+      return 'role' in data ? data.role
+        : 'Role' in data ? data.Role
+        : 'userRole' in data ? data.userRole
+        : 'user_role' in data ? data.user_role
+        : null;
+    }
+
+    // Normalize role the same way as AuthContext.normalizeClientRole so
+    // "Super Admin", "super-admin", "SUPER_ADMIN", etc. all match rules.
+    function normalizeRole(raw) {
+      return raw == null
+        ? ''
+        : string(raw).lower().replace('[\\s\\-]+', '_');
+    }
+
+    function role() {
+      return hasUserDoc() ? normalizeRole(rawRole(userDoc())) : '';
+    }
+
+    function isSuperAdmin() {
+      return role() == 'super_admin';
+    }
+
+    // Admin-level (admin + super_admin)
+    function isAdmin() {
+      return role() in ['admin', 'super_admin'];
+    }
+
+    // Strict admin only (not super_admin)
+    function isStrictAdmin() {
+      return role() == 'admin';
+    }
+
+    function isHead() {
+      return role() in ['super_admin', 'admin', 'headteacher'];
+    }
+
+    function isBursarRole() {
+      return role() in ['super_admin', 'admin', 'bursar'];
+    }
+
+    // Finance/admissions/transport readers — deliberately excludes
+    // class_teacher and teacher (client requirement: those two roles only
+    // get exam-related tools, not Fees/Transport/Admissions). Kept separate
+    // from isStaff()/canReadSchoolData() below, which still cover
+    // attendance/students for those roles.
+    function isFinanceOpsStaff() {
+      return role() in ['super_admin', 'admin', 'headteacher', 'bursar'];
+    }
+
+    function isStaff() {
+      return role() in [
+        'super_admin', 'admin', 'headteacher', 'bursar', 'class_teacher', 'teacher'
+      ];
+    }
+
+    function isParent() {
+      return role() == 'parent';
+    }
+
+    function isTeacherStaff() {
+      return role() in ['super_admin', 'admin', 'headteacher', 'teacher', 'class_teacher'];
+    }
+
+    // Ownership check for documents scoped to "the teacher who created it"
+    // (Exam Page Builder / WPS papers, WPS question bank). Docs have been
+    // stamped with either created_by or createdBy over time, and with
+    // either the uid or the email depending on which field the client had
+    // handy — so check both field names and both identity forms rather
+    // than assuming one canonical shape.
+    function isOwnerOf(data) {
+      return isSignedIn() && (
+        (('created_by' in data) && data.created_by != null
+          && (data.created_by == uid() || data.created_by == request.auth.token.email))
+        || (('createdBy' in data) && data.createdBy != null
+          && (data.createdBy == uid() || data.createdBy == request.auth.token.email))
+      );
+    }
+
+    // Attendance writers: admin + headteacher + class_teacher
+    function canMarkAttendance() {
+      return role() in ['super_admin', 'admin', 'headteacher', 'class_teacher'];
+    }
+
+    // Admission (students collection) writers: admin + head only
+    function canWriteStudents() {
+      return role() in ['super_admin', 'admin', 'headteacher'];
+    }
+
+    function studentAccountPath() {
+      return /databases/$(database)/documents/studentAccounts/$(uid());
+    }
+
+    function isStudentAccount() {
+      return isSignedIn()
+        && exists(studentAccountPath())
+        && normalizeRole(get(studentAccountPath()).data.role) == 'student';
+    }
+
+    function isStudentUser() {
+      return role() == 'student' || isStudentAccount();
+    }
+
+    // ── Learning Hub fee lock (server-side, tamper-proof) ─────
+    // The client (hubExtras.js assertStudentFeesCleared / checkEligibility)
+    // already tries to block a student with an outstanding balance from
+    // using Learning Hub, but that check runs in the browser: a student can
+    // edit localStorage, replay old React state, or call the Firestore SDK
+    // directly from devtools and skip it entirely. These functions make the
+    // lock real by gating the actual document reads/writes in the rules
+    // themselves, using a balance the student cannot write.
+    //
+    // fee_balance / fees_cleared live on students/{id} and are maintained
+    // ONLY by syncStudentFeeBalance() (src/lib/hubExtras.js), called from
+    // Fees.jsx every time a fee_payments row changes, and written via a
+    // students/{id} update restricted below to finance/admin/head roles for
+    // exactly those fields. A student has no write path to fee_payments or
+    // to these fields — so nothing they do in the client can move the
+    // number this gate actually checks.
+    function studentAccountData() {
+      return exists(studentAccountPath()) ? get(studentAccountPath()).data : {};
+    }
+
+    // Resolve the students/{id} doc linked to the signed-in student's own
+    // account. Checks both the current field name (linkedStudentId, set by
+    // StudentLogin.jsx) and the legacy one (student_doc_id) so older
+    // accounts are still covered.
+    function linkedStudentId() {
+      return ('linkedStudentId' in studentAccountData()
+              && studentAccountData().linkedStudentId is string
+              && studentAccountData().linkedStudentId != '')
+        ? studentAccountData().linkedStudentId
+        : (('student_doc_id' in studentAccountData())
+              && studentAccountData().student_doc_id is string
+              && studentAccountData().student_doc_id != ''
+            ? studentAccountData().student_doc_id
+            : null);
+    }
+
+    function linkedStudentDoc() {
+      return (linkedStudentId() != null && exists(studentDocPath(linkedStudentId())))
+        ? get(studentDocPath(linkedStudentId())).data
+        : null;
+    }
+
+    // Unmatched account (no linked students/{id} doc) → treated as locked,
+    // same as the client's "admission record could not be matched" case.
+    // A linked doc with no fee_balance field yet (pre-migration, before the
+    // first sync has run) is treated as cleared so existing schools are not
+    // instantly locked out school-wide the moment this rule ships — run the
+    // "Recalculate Balances" action in Fees once after deploying to close
+    // that gap immediately.
+    function studentFeeBalance() {
+      return linkedStudentDoc() == null
+        ? 999999999
+        : (('fee_balance' in linkedStudentDoc()) ? linkedStudentDoc().fee_balance : 0);
+    }
+
+    function studentFeesCleared() {
+      return studentFeeBalance() <= 0;
+    }
+
+    // Finance roles allowed to write the canonical fee_balance fields.
+    function canSyncFeeBalance() {
+      return isFinanceOpsStaff();
+    }
+
+    // Shared "view: all" read gate for students/admissions/attendance/fees.
+    // Parents used to be included here too (blanket read of every family's
+    // records) — that's now split out: staff still see everything, parents
+    // are scoped per-record to their own linked child via
+    // isLinkedParentOf() / isParentOfStudentId() below.
+    function canReadSchoolData() {
+      return isStaff();
+    }
+
+    // ── Parent → child linkage ────────────────────────────────
+    // Kenyan schools link a parent to a student by email (there's no
+    // dedicated parent_uid field): the student record carries whichever of
+    // parent_email / parentEmail / guardian_email / guardianEmail the
+    // office typed in. Match against the parent's own verified auth email
+    // only — phone/name matching used for display grouping in the client
+    // is a weak, spoofable signal and is intentionally NOT trusted here as
+    // an access-control check.
+    function normalizeContact(v) {
+      return v == null ? '' : string(v).lower();
+    }
+
+    function fieldOrEmpty(data, key) {
+      return key in data ? data[key] : null;
+    }
+
+    // True when `data` is a students/* document whose parent/guardian email
+    // matches the signed-in parent's own auth email.
+    function isLinkedParentOf(data) {
+      return isSignedIn() && role() == 'parent'
+        && normalizeContact(request.auth.token.email) != ''
+        && (
+          normalizeContact(fieldOrEmpty(data, 'parent_email')) == normalizeContact(request.auth.token.email)
+          || normalizeContact(fieldOrEmpty(data, 'parentEmail')) == normalizeContact(request.auth.token.email)
+          || normalizeContact(fieldOrEmpty(data, 'guardian_email')) == normalizeContact(request.auth.token.email)
+          || normalizeContact(fieldOrEmpty(data, 'guardianEmail')) == normalizeContact(request.auth.token.email)
+          || normalizeContact(fieldOrEmpty(data, 'parent_email_lc')) == normalizeContact(request.auth.token.email)
+        );
+    }
+
+    function studentDocPath(studentId) {
+      return /databases/$(database)/documents/students/$(studentId);
+    }
+
+    // For collections that reference a student by id (attendance,
+    // fee_payments, exam_scores, cbc_assessments, ...) rather than storing
+    // the parent's email directly: look up the referenced students/* doc
+    // and check linkage there. Always does its own lookup rather than
+    // trusting the query the client happened to run, since a client could
+    // otherwise just query with someone else's student_id.
+    function isParentOfStudentId(studentId) {
+      return isSignedIn() && role() == 'parent'
+        && studentId is string && studentId != ''
+        && exists(studentDocPath(studentId))
+        && isLinkedParentOf(get(studentDocPath(studentId)).data);
+    }
+
+    // Server-side tier gate. Client-side route guards can be bypassed by
+    // typing a URL or calling Firestore directly, so feature data is also
+    // protected here. Super Admin is exempt so the plan can be repaired.
+    // If the tier document is missing, treat as growth (full module access)
+    // so a missing config cannot lock every user out of writes.
+    //
+    // Growth automatically reverts to Community-level access once its
+    // grace_ends_at has passed — mirrors lib/appTier.js effectiveTier() —
+    // so an expired grace period can't be used to keep Growth-only writes
+    // open just because nobody has flipped the stored `tier` field. Only
+    // resetToGrowthTier (Super Admin only, from the app) renews grace_ends_at
+    // and thereby restores Growth here too.
+    function tierGraceActive() {
+      return !('grace_ends_at' in get(/databases/$(database)/documents/app_config/tier).data)
+        || get(/databases/$(database)/documents/app_config/tier).data.grace_ends_at == null
+        || request.time < get(/databases/$(database)/documents/app_config/tier).data.grace_ends_at;
+    }
+
+    function moduleEnabled(moduleKey) {
+      return isSuperAdmin()
+        || isAdmin()
+        || !exists(/databases/$(database)/documents/app_config/tier)
+        || (
+          (
+            (get(/databases/$(database)/documents/app_config/tier).data.tier == 'growth' && tierGraceActive())
+            || !(get(/databases/$(database)/documents/app_config/tier).data.tier in ['community', 'growth'])
+          )
+          && (
+            !('hidden_apps' in get(/databases/$(database)/documents/app_config/tier).data)
+            || !(moduleKey in get(/databases/$(database)/documents/app_config/tier).data.hidden_apps)
+          )
+        )
+        || (
+          (
+            get(/databases/$(database)/documents/app_config/tier).data.tier == 'community'
+            || (get(/databases/$(database)/documents/app_config/tier).data.tier == 'growth' && !tierGraceActive())
+          )
+          // Community includes the parent dashboard and its read-only data
+          // dependencies. Keep writes protected by the separate role checks.
+          && moduleKey in [
+            'dashboard', 'students', 'fees', 'attendance', 'admissions',
+            'exam_entry', 'assignments', 'announcements',
+            // Teachers publish Word exams; students sit them on Community tier
+            'learning_hub',
+            // Parents view their children's CBC assessments / report preview
+            'cbc',
+            // Parents view their children's exam report cards
+            'print_cards'
+          ]
+          && (
+            !('hidden_apps' in get(/databases/$(database)/documents/app_config/tier).data)
+            || !(moduleKey in get(/databases/$(database)/documents/app_config/tier).data.hidden_apps)
+          )
+        );
+    }
+
+    // ── users ────────────────────────────────────────────────
+    match /users/{userId} {
+      // Staff + parents: full directory so Teacher Chat contact lists can load
+      // (Firestore list queries require every returned document to be readable).
+      allow read: if isSignedIn() && (uid() == userId || isStaff() || isParent());
+
+      // Self-signup: parent always allowed (email must match the caller's own
+      // verified auth token — see SECURITY note); invited staff may take
+      // invited role when staffInvites/{staffId} is pending and email+role
+      // match. Google claim: emailIndex/{email} pre-provision (bulk-friendly).
+      allow create: if isAdmin()
+        // SECURITY: previously had no email constraint at all, so any
+        // self-signed-up "parent" could write an arbitrary `email` field —
+        // since users/{uid} is fully readable by every staff member and
+        // parent (Teacher Chat directory, etc.), that let anyone impersonate
+        // another person's address across the app. Now pinned to the
+        // caller's own Google/Firebase-verified token email.
+        || (isSignedIn()
+            && uid() == userId
+            && request.resource.data.role == 'parent'
+            && request.resource.data.email is string
+            && request.resource.data.email == request.auth.token.email)
+        || (isSignedIn()
+            && uid() == userId
+            && request.resource.data.staffId is string
+            && request.resource.data.staffId.size() > 0
+            && request.resource.data.role in [
+              'teacher', 'class_teacher', 'bursar', 'headteacher', 'admin'
+            ]
+            && request.resource.data.email is string
+            && request.resource.data.email == request.auth.token.email
+            && exists(/databases/$(database)/documents/staffInvites/$(request.resource.data.staffId))
+            && get(/databases/$(database)/documents/staffInvites/$(request.resource.data.staffId)).data.status == 'pending'
+            && get(/databases/$(database)/documents/staffInvites/$(request.resource.data.staffId)).data.email
+                 == request.resource.data.email
+            && get(/databases/$(database)/documents/staffInvites/$(request.resource.data.staffId)).data.role
+                 == request.resource.data.role)
+        || (isSignedIn()
+            && uid() == userId
+            && request.resource.data.email is string
+            && request.resource.data.role is string
+            && request.resource.data.role in [
+              'parent', 'teacher', 'class_teacher', 'bursar', 'headteacher', 'admin', 'student'
+            ]
+            && exists(/databases/$(database)/documents/emailIndex/$(request.resource.data.email))
+            && get(/databases/$(database)/documents/emailIndex/$(request.resource.data.email)).data.email
+                 == request.resource.data.email
+            && normalizeRole(get(/databases/$(database)/documents/emailIndex/$(request.resource.data.email)).data.role)
+                 == normalizeRole(request.resource.data.role)
+            && request.auth.token.email == request.resource.data.email);
+
+      // Super admin can manage any user (including admins).
+      // Strict admin cannot create/delete/promote other admins or super_admins.
+      allow update: if isSuperAdmin()
+        || (isStrictAdmin()
+            && !(normalizeRole(resource.data.role) in ['super_admin', 'admin'])
+            && !(normalizeRole(request.resource.data.role) in ['super_admin', 'admin']))
+        || (isHead()
+            && !(normalizeRole(resource.data.role) in ['super_admin', 'admin'])
+            && !(normalizeRole(request.resource.data.role) in ['super_admin', 'admin']))
+        || (uid() == userId
+            && (!request.resource.data.diff(resource.data).affectedKeys()
+                  .hasAny(['role', 'staffId'])));
+
+      allow delete: if isSuperAdmin()
+        || (isStrictAdmin()
+            && !(normalizeRole(resource.data.role) in ['super_admin', 'admin']));
+    }
+
+    // ── staffIds (Staff ID → email lookup for client-only login) ──
+    // Docs keyed by Staff ID. get-by-ID only (no list) so IDs cannot be enumerated.
+    match /staffIds/{staffId} {
+      allow get: if true;
+      allow list: if false;
+      // Self on signup, or admin/head backfill from User Control
+      allow create: if isAdmin()
+        || isHead()
+        || (isSignedIn()
+            && request.resource.data.uid == uid()
+            && request.resource.data.email is string);
+      allow update: if isAdmin()
+        || isHead()
+        || (isSignedIn() && resource.data.uid == uid());
+      allow delete: if isAdmin();
+    }
+
+    // ── emailIndex (email → uid for password-reset existence checks) ──
+    // Doc ID = lowercased email. Public get-by-ID only (same pattern as staffIds).
+    // Password-reset runs while signed out; we must NOT allow list on users.
+    // Clients call get(emailIndex/{email}) to confirm the address is a school account
+    // before Firebase sends a reset email. Enumeration of all emails is blocked.
+    match /emailIndex/{email} {
+      allow get: if true;
+      allow list: if false;
+      // Admin/head maintain the index; user may create/update own row on signup/profile.
+      // SECURITY: self-serve create/update must never be able to set or change
+      // `role`. This doc is later trusted (in users/{uid}'s create rule) to grant
+      // a role via Google Sign-In's pre-provisioned-account claim path — if a
+      // self-authenticated user could write their own `role` here (e.g. 'admin'),
+      // they could self-provision an emailIndex row with their own verified
+      // Google email and immediately claim that role on first login, with no
+      // admin ever having invited or approved them. Only admin/head may set role.
+      allow create: if isAdmin()
+        || isHead()
+        || (isSignedIn()
+            && request.resource.data.uid == uid()
+            && request.resource.data.email is string
+            && request.resource.data.email == email
+            && !('role' in request.resource.data));
+      allow update: if isAdmin()
+        || isHead()
+        || (isSignedIn()
+            && resource.data.uid == uid()
+            && request.resource.data.uid == uid()
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']));
+      allow delete: if isAdmin() || isHead();
+    }
+
+    // ── staffInvites (admin invites teacher/staff for first-time signup) ──
+    // Doc ID = Staff ID. Public get-by-ID so invitee can claim role at signup.
+    match /staffInvites/{staffId} {
+      allow get: if true;
+      allow list: if isAdmin() || isHead();
+      allow create: if isAdmin() || isHead();
+      // Admin/head manage invites; invitee may mark own invite used after signup
+      allow update: if isAdmin() || isHead()
+        || (isSignedIn()
+            && resource.data.status == 'pending'
+            && request.resource.data.status == 'used'
+            && request.resource.data.auth_uid == uid());
+      allow delete: if isAdmin();
+    }
+
+    // ── studentInvites (first-time Student Portal — get by admission ID only) ──
+    // Doc ID = normalized admission number. Public get; no list (cannot enumerate).
+    match /studentInvites/{inviteId} {
+      // Must be signed in (Student first-time creates Auth, then looks up invite).
+      // No public anonymous probing of admission numbers.
+      allow get: if isSignedIn();
+      allow list: if false;
+      allow create, update: if canWriteStudents() || isAdmin();
+      allow delete: if isAdmin() || canWriteStudents();
+    }
+
+    // ── students (Admission page) ────────────────────────────
+    match /students/{studentId} {
+      // Parents may read only the student record(s) linked to them —
+      // previously any parent could read the entire students collection.
+      allow read: if moduleEnabled('students') && (
+        canReadSchoolData() || isStudentUser() || isLinkedParentOf(resource.data)
+      );
+      // Narrow exception: teacher / class_teacher (exam-entry roles, who
+      // otherwise have no access to the Admission/Students page at all) may
+      // create a student doc ONLY as a side effect of the Exam Entry ↔
+      // Google Sheets import matching an unrecognised name — never through
+      // the Students/Admission UI itself (that stays admin/head only). The
+      // whitelist keeps this to exactly the fields ExamEntry.ensureRosterStudents
+      // writes, so the exception can't be used to smuggle in arbitrary
+      // student data (fees, guardian contacts, etc).
+      allow create: if moduleEnabled('students') && (
+        canWriteStudents()
+        || (moduleEnabled('exam_entry')
+            && role() in ['teacher', 'class_teacher']
+            && request.resource.data.source == 'exam_import'
+            && request.resource.data.keys().hasOnly([
+              'first_name', 'last_name', 'class_name', 'class',
+              'admission_number', 'created_at', 'created_by', 'source'
+            ]))
+      );
+      // Full record: admin/head only, as before. Narrow exception: finance
+      // staff (bursar/head/admin) may ALSO update purely to resync the
+      // canonical fee_balance/fees_cleared/fee_balance_synced_at fields that
+      // gate Learning Hub — and only those fields, via syncStudentFeeBalance.
+      // This is what lets a bursar recording a payment (not otherwise able
+      // to edit student records) unlock the account, without opening up the
+      // rest of the student's record to the finance role.
+      allow update: if moduleEnabled('students') && (
+        canWriteStudents()
+        || (canSyncFeeBalance()
+            && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['fee_balance', 'fees_cleared', 'fee_balance_synced_at', 'updated_at']))
+      );
+      allow delete: if moduleEnabled('students') && (isAdmin());
+    }
+
+    // ── admissions (Application Form) ────────────────────────
+    // Parents may create once; status/remarks changes: admin/head only
+    match /admissions/{id} {
+      // Parent (or any other non-staff signed-in user) may read only the
+      // application(s) they themselves submitted or are named on —
+      // previously `isSignedIn()` let ANY signed-in account (any parent,
+      // any student) read every family's application, full stop.
+      allow read: if moduleEnabled('admissions') && (
+        isFinanceOpsStaff()
+        || (isSignedIn() && (
+          resource.data.created_by == uid()
+          || resource.data.submitted_by == request.auth.token.email
+          || isLinkedParentOf(resource.data)
+        ))
+      );
+      // Admin/head/bursar/parent may create application rows (import + form).
+      // class_teacher/teacher excluded — Admissions is hidden from them.
+      allow create: if moduleEnabled('admissions') && isSignedIn()
+        && (isAdmin() || isHead() || isParent() || role() == 'bursar');
+      // Head/admin: full update. Applicant may update own non-status fields.
+      // created_by (uid) OR submitted_by (email) both accepted for ownership.
+      allow update: if moduleEnabled('admissions') && (
+        isHead() || isAdmin()
+        || (isSignedIn()
+            && (
+              resource.data.created_by == uid()
+              || resource.data.submitted_by == request.auth.token.email
+            )
+            && !request.resource.data.diff(resource.data).affectedKeys()
+                .hasAny(['status', 'remarks', 'admin_notes'])));
+      allow delete: if moduleEnabled('admissions') && (isAdmin() || isHead());
+    }
+
+    // ── attendance ───────────────────────────────────────────
+    match /attendance/{id} {
+      // Parents may read only their own linked child's attendance rows —
+      // previously any parent could read the whole school's attendance.
+      allow read: if moduleEnabled('attendance') && (
+        canReadSchoolData() || isParentOfStudentId(fieldOrEmpty(resource.data, 'student_id'))
+      );
+      allow create, update: if moduleEnabled('attendance') && (canMarkAttendance());
+      allow delete: if moduleEnabled('attendance') && (isAdmin());
+    }
+
+    // ── fee_payments ─────────────────────────────────────────
+    match /fee_payments/{id} {
+      // Parents may read only their own linked child's fee/payment rows —
+      // previously any parent could read every family's fee payments. The
+      // UI (ParentHome) now shows only paid/pending/overdue totals derived
+      // from these rows rather than a raw transaction list.
+      allow read: if moduleEnabled('fees') && (
+        isFinanceOpsStaff() || isParentOfStudentId(fieldOrEmpty(resource.data, 'student_id'))
+      );
+      // Bursar, admin, headteacher (same as Finance Hub)
+      allow create, update: if moduleEnabled('fees') && ((isBursarRole() || isHead()));
+      allow delete: if moduleEnabled('fees') && ((isBursarRole() || isHead()));
+    }
+
+    // ── fee_payment_logs ─────────────────────────────────────
+    // Immutable audit trail for fee payments, installments/top-ups and
+    // grace-period notices. Staff may read; finance/admin/head may write.
+    // Deletion is restricted to admin so ordinary payment recording cannot
+    // silently remove the audit trail.
+    match /fee_payment_logs/{id} {
+      allow read: if moduleEnabled('fees') && (isFinanceOpsStaff());
+      allow create: if moduleEnabled('fees') && ((isBursarRole() || isHead()));
+      allow update: if moduleEnabled('fees') && ((isBursarRole() || isHead()));
+      allow delete: if moduleEnabled('fees') && (isAdmin());
+    }
+
+    // ── exams (Exam Page Builder) ────────────────────────────
+    match /exams/{id} {
+      allow read: if moduleEnabled('exams') && (isTeacherStaff());
+      allow create, update, delete: if moduleEnabled('exams') && (isTeacherStaff());
+    }
+
+    // ── exam_submissions (legacy / online) ───────────────────
+    match /exam_submissions/{id} {
+      allow read: if moduleEnabled('online_exam') && (isTeacherStaff()
+        || (isStudentUser() && resource.data.user_id == uid()));
+      allow create: if moduleEnabled('online_exam') && (isStudentUser() || isTeacherStaff());
+      allow update: if moduleEnabled('online_exam') && (isTeacherStaff()
+        || (isStudentUser() && resource.data.user_id == uid()));
+      allow delete: if moduleEnabled('online_exam') && (isAdmin());
+    }
+
+    // ── exam_scores (Exam Entry snapshots) ───────────────────
+    match /exam_scores/{id} {
+      // Parents may read only their own linked child's results —
+      // previously any parent could read every student's exam scores.
+      allow read: if moduleEnabled('exam_entry') && (
+        isTeacherStaff() || isHead()
+        || isParentOfStudentId(fieldOrEmpty(resource.data, 'student_id'))
+      );
+      allow create, update: if moduleEnabled('exam_entry') && (isTeacherStaff());
+      allow delete: if moduleEnabled('exam_entry') && (isAdmin());
+    }
+
+    // ── question_papers (Exam Page Builder + WPS) ────────────
+    // STRICT owner-only for staff: the teacher who created the paper is the
+    // only staff member who may read, edit, or delete it. This prevents
+    // peer teachers (and even head/admin accounts using the app UI) from
+    // opening or suddenly deleting someone else's exam.
+    // Parents may still read published papers only (read-only portal view).
+    // create requires created_by / createdBy = current uid or email.
+    // update must not reassign ownership to another user.
+    match /question_papers/{id} {
+      allow read: if moduleEnabled('question_papers') && (
+        (isTeacherStaff() && isOwnerOf(resource.data))
+        || (isParent() && resource.data.status == 'published')
+      );
+      allow create: if moduleEnabled('question_papers') && isTeacherStaff()
+        && isOwnerOf(request.resource.data);
+      allow update: if moduleEnabled('question_papers') && isTeacherStaff()
+        && isOwnerOf(resource.data)
+        && isOwnerOf(request.resource.data);
+      allow delete: if moduleEnabled('question_papers') && isTeacherStaff()
+        && isOwnerOf(resource.data);
+    }
+
+    // ── exam_bank (WPS question bank) ─────────────────────────
+    // Same strict owner-only policy as question_papers.
+    match /exam_bank/{id} {
+      allow read: if moduleEnabled('question_papers') && isTeacherStaff()
+        && isOwnerOf(resource.data);
+      allow create: if moduleEnabled('question_papers') && isTeacherStaff()
+        && isOwnerOf(request.resource.data);
+      allow update: if moduleEnabled('question_papers') && isTeacherStaff()
+        && isOwnerOf(resource.data)
+        && isOwnerOf(request.resource.data);
+      allow delete: if moduleEnabled('question_papers') && isTeacherStaff()
+        && isOwnerOf(resource.data);
+    }
+
+    // ── studentAccounts ──────────────────────────────────────
+    match /studentAccounts/{accountId} {
+      allow read: if (isSignedIn() && uid() == accountId) || isStaff();
+      allow create: if isAdmin()
+        || isTeacherStaff()
+        || (isSignedIn()
+            && uid() == accountId
+            && request.resource.data.role == 'student');
+      allow update: if isAdmin()
+        || isTeacherStaff()
+        || (isSignedIn() && uid() == accountId);
+      allow delete: if isAdmin();
+    }
+
+    // ── announcements ────────────────────────────────────────
+    match /announcements/{id} {
+      allow read: if moduleEnabled('announcements') && (isSignedIn());
+      allow create, update, delete: if moduleEnabled('announcements') && (isAdmin()
+        || isHead()
+        || role() == 'bursar');
+    }
+
+    // ── activities ───────────────────────────────────────────
+    match /activities/{id} {
+      allow read: if moduleEnabled('activities') && (isSignedIn());
+      allow create, update, delete: if moduleEnabled('activities') && (isHead());
+    }
+
+    // ── audit_log ────────────────────────────────────────────
+    match /audit_log/{id} {
+      allow read: if moduleEnabled('audit_log') && (isHead());
+      allow create: if moduleEnabled('audit_log') && (isSignedIn());
+      allow update, delete: if moduleEnabled('audit_log') && (false);
+    }
+
+    // ── Learning Hub: courses ────────────────────────────────
+    match /courses/{id} {
+      allow read: if moduleEnabled('learning_hub') && (isTeacherStaff() || isStudentUser() || isParent());
+      allow create, delete: if moduleEnabled('learning_hub') && (isTeacherStaff());
+      // Staff full update; students may only change enrollment fields, and
+      // only while their fee balance is clear (self-enrolling is a Learning
+      // Hub action too — otherwise a locked student could still add
+      // themselves to new courses even though they can't open any content).
+      allow update: if moduleEnabled('learning_hub') && (isTeacherStaff()
+        || (isStudentUser()
+            && studentFeesCleared()
+            && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['enrolled', 'enrolled_details'])));
+    }
+
+    // ── Learning Hub: lessons ────────────────────────────────
+    // Actual lesson content (video/text/attachments) lives here — this is
+    // the real hub-lock enforcement point. A student reads it only while
+    // studentFeesCleared() (see above); no client trick changes that value.
+    match /lessons/{id} {
+      allow read: if moduleEnabled('learning_hub') && (
+        isTeacherStaff() || (isStudentUser() && studentFeesCleared())
+      );
+      allow create, update, delete: if moduleEnabled('learning_hub') && (isTeacherStaff());
+    }
+
+    // ── Learning Hub: hub_exams ──────────────────────────────
+    // Teachers create/publish; students & parents may read published exams
+    // (including the full questions array needed to sit the paper). The
+    // trailing "any signed-in user" clause is scoped away from students
+    // (!isStudentUser()) — otherwise a fee-locked student, who is also
+    // isSignedIn(), could still read every published exam through it.
+    match /hub_exams/{id} {
+      allow read: if moduleEnabled('learning_hub') && (
+        isTeacherStaff()
+        || (isStudentUser() && studentFeesCleared())
+        || isParent()
+        || (isSignedIn() && !isStudentUser() && resource.data.published == true)
+      );
+      allow create, update, delete: if moduleEnabled('learning_hub') && (isTeacherStaff());
+    }
+
+    // ── Learning Hub: hub_submissions ────────────────────────
+    // Reading a student's own past marks/results is left open even while
+    // locked (work already done shouldn't vanish); it's new work — creating
+    // or updating a submission — that the fee gate blocks.
+    match /hub_submissions/{id} {
+      allow read: if moduleEnabled('learning_hub') && (isTeacherStaff()
+        || isParent()
+        || (isStudentUser()
+            && (resource.data.user_id == uid()
+                || resource.data.user_email == request.auth.token.email)));
+      // Students may create their own enrollment / exam / lesson marks only
+      allow create: if moduleEnabled('learning_hub') && (
+        isTeacherStaff()
+        || (isStudentUser()
+            && studentFeesCleared()
+            && request.resource.data.user_id == uid())
+      );
+      allow update: if moduleEnabled('learning_hub') && (isTeacherStaff()
+        || (isStudentUser()
+            && studentFeesCleared()
+            && resource.data.user_id == uid()
+            && request.resource.data.user_id == uid()));
+      allow delete: if moduleEnabled('learning_hub') && (isAdmin() || isHead());
+    }
+
+    // ── learning_progress (optional legacy) ──────────────────
+    match /learning_progress/{id} {
+      allow read: if moduleEnabled('learning_hub') && (isTeacherStaff() || isStudentUser() || isParent());
+      allow create, update: if moduleEnabled('learning_hub') && (
+        (isSignedIn() && !isStudentUser()) || (isStudentUser() && studentFeesCleared())
+      );
+      allow delete: if moduleEnabled('learning_hub') && (isAdmin());
+    }
+
+
+
+    match /library_books/{id} {
+      // Catalogue visible only when the Library module is enabled.
+      allow read: if moduleEnabled('library') && (isSignedIn());
+      allow create, update, delete: if moduleEnabled('library') && ((isTeacherStaff() || isHead()));
+    }
+    match /library_loans/{id} {
+      allow read: if moduleEnabled('library') && (isStaff()
+        || (isSignedIn()
+            && (resource.data.borrower_email == request.auth.token.email
+                || resource.data.issued_by == request.auth.uid)));
+      allow create, update, delete: if moduleEnabled('library') && (isTeacherStaff() || isHead());
+    }
+    match /library_requests/{id} {
+      allow read: if moduleEnabled('library') && (isStaff()
+        || (isSignedIn() && resource.data.requester_uid == request.auth.uid));
+      allow create: if moduleEnabled('library') && (isSignedIn());
+      allow update, delete: if moduleEnabled('library') && (isTeacherStaff() || isHead());
+    }
+    match /library_reservations/{id} {
+      allow read: if moduleEnabled('library') && (isSignedIn());
+      allow create: if moduleEnabled('library') && (isSignedIn());
+      allow update, delete: if moduleEnabled('library') && (isTeacherStaff() || isHead());
+    }
+    match /notifications/{id} {
+      allow read: if moduleEnabled('announcements') && (isSignedIn()
+        && (resource.data.to_email == request.auth.token.email || isHead() || role() == 'bursar'));
+      allow create: if moduleEnabled('announcements') && (isHead() || role() == 'bursar' || isAdmin());
+      allow update: if moduleEnabled('announcements') && (isSignedIn()
+        && resource.data.to_email == request.auth.token.email);
+      allow delete: if moduleEnabled('announcements') && (isHead() || isAdmin());
+    }
+    match /transport_routes/{id} {
+      allow read: if moduleEnabled('transport') && (isFinanceOpsStaff());
+      allow create, update, delete: if moduleEnabled('transport') && ((isHead() || isBursarRole() || isAdmin()));
+    }
+    match /transport_assignments/{id} {
+      allow read: if moduleEnabled('transport') && (isFinanceOpsStaff());
+      allow create, update, delete: if moduleEnabled('transport') && (isHead() || isBursarRole() || isAdmin());
+    }
+    match /payroll_runs/{id} {
+      allow read: if moduleEnabled('payroll') && ((isHead() || isBursarRole()));
+      allow create, update, delete: if moduleEnabled('payroll') && ((isAdmin() || role() == 'bursar'));
+    }
+    match /school_settings/{id} {
+      allow read: if moduleEnabled('settings') && (isStaff());
+      // Super admin, admin, and head can save / archive / delete settings
+      allow create, update, delete: if moduleEnabled('settings') && (isSuperAdmin() || isAdmin() || isHead());
+    }
+    // App config: public read (lock screen + tier before/after login).
+    // status = app lock → admin or super_admin
+    // tier   = Community/Growth + hidden apps → super_admin only
+    // Role is normalized so "Super Admin" / "super-admin" still match.
+    // App lock (status) + tier.
+    // Admin may lock/unlock only when the current lock is not owned by super_admin.
+    // Super admin may always change status.
+    match /app_config/{id} {
+      allow read: if true;
+      allow create, update, delete: if isSignedIn() && (
+        (id == 'status' && (
+          isSuperAdmin()
+          || (isStrictAdmin()
+              && (
+                // Creating / locking when unlocked, or unlocking own (non-super) lock
+                !resource.exists
+                || resource.data.locked != true
+                || !('locked_by_role' in resource.data)
+                || resource.data.locked_by_role == null
+                || resource.data.locked_by_role == ''
+                || resource.data.locked_by_role == 'admin'
+              ))
+        ))
+        || (id == 'tier' && isSuperAdmin())
+        || (id != 'status' && id != 'tier' && isSuperAdmin())
+      );
+    }
+    match /school_classes/{id} {
+      allow read: if moduleEnabled('students') && (isStaff());
+      allow create, update, delete: if moduleEnabled('students') && ((isHead() || isAdmin()));
+    }
+    // Staff chat — all school staff may read & post (not restricted/disabled).
+    // Supports live onSnapshot and quiet polling fallback equally.
+    match /staff_meeting/{id} {
+      allow read: if moduleEnabled('staff_meeting') && (isStaff());
+      allow create: if moduleEnabled('staff_meeting') && (isStaff());
+      allow update, delete: if moduleEnabled('staff_meeting') && (isHead() || isAdmin()
+        || (isSignedIn() && resource.data.author_uid == request.auth.uid));
+    }
+
+    // Staff chat presence (online / away heartbeats)
+    // Parentheses intentionally close: outer allow condition + isStaff() condition + inner presence condition.
+    match /staff_meeting_presence/{id} {
+      allow read: if moduleEnabled('staff_meeting') && (isStaff());
+      allow create: if moduleEnabled('staff_meeting') && (isStaff());
+      allow update: if moduleEnabled('staff_meeting') && (isStaff()
+        && (
+          resource.data.user_uid == request.auth.uid
+          || resource.data._presence_key == request.auth.uid
+          || isHead()
+          || isAdmin()
+        ));
+      allow delete: if moduleEnabled('staff_meeting') && (isHead() || isAdmin()
+        || (isStaff() && (
+          resource.data.user_uid == request.auth.uid
+          || resource.data._presence_key == request.auth.uid
+        )));
+    }
+
+    // ── timetable ────────────────────────────────────────────
+    match /timetable/{id} {
+      allow read: if moduleEnabled('timetable') && (isStaff());
+      // Admin, head, class teachers and teachers can manage slots
+      allow create, update, delete: if moduleEnabled('timetable') && (isHead() || isAdmin() || role() in ['class_teacher', 'teacher']);
+    }
+
+    // Timetable period labels/times share the same write permissions as timetable slots.
+    match /timetable_periods/{id} {
+      allow read: if moduleEnabled('timetable') && (isStaff());
+      allow create, update, delete: if moduleEnabled('timetable') && (isHead() || isAdmin() || role() in ['class_teacher', 'teacher']);
+    }
+
+    // Daily generation quota (shared across devices). Doc id: daily_generation
+    match /timetable_usage/{id} {
+      allow read: if moduleEnabled('timetable') && (isStaff());
+      allow create, update: if moduleEnabled('timetable') && (isHead() || isAdmin() || role() in ['class_teacher', 'teacher']);
+      allow delete: if moduleEnabled('timetable') && (isHead() || isAdmin());
+    }
+
+    // ── Finance Hub (bursar, admin, headteacher) ─────────────
+    match /budget_programs/{id} {
+      allow read: if moduleEnabled('finance') && (isHead() || isBursarRole());
+      allow create, update, delete: if moduleEnabled('finance') && (isHead() || isBursarRole());
+    }
+    match /budget_allocations/{id} {
+      allow read: if moduleEnabled('finance') && (isHead() || isBursarRole());
+      allow create, update, delete: if moduleEnabled('finance') && (isHead() || isBursarRole());
+    }
+    match /finance_transactions/{id} {
+      allow read: if moduleEnabled('finance') && (isHead() || isBursarRole());
+      allow create, update, delete: if moduleEnabled('finance') && (isHead() || isBursarRole());
+    }
+    match /finance_approvals/{id} {
+      allow read: if moduleEnabled('finance') && (isHead() || isBursarRole());
+      allow create: if moduleEnabled('finance') && (isHead() || isBursarRole());
+      // Head/admin resolve; requester may cancel own PENDING
+      allow update: if moduleEnabled('finance') && (isHead() || isAdmin()
+        || (isBursarRole() && resource.data.status == 'PENDING'
+            && resource.data.requested_by == request.auth.uid));
+      allow delete: if moduleEnabled('finance') && (isHead() || isAdmin());
+    }
+    match /fee_structure/{id} {
+      allow read: if moduleEnabled('finance') && (isHead() || isBursarRole());
+      allow create, update, delete: if moduleEnabled('finance') && (isHead() || isBursarRole());
+    }
+    match /bank_accounts/{id} {
+      allow read: if moduleEnabled('finance') && (isHead() || isBursarRole());
+      allow create, update, delete: if moduleEnabled('finance') && (isHead() || isBursarRole());
+    }
+
+    // ── CBC Assessment Hub (all teachers read/write) ─────────
+    match /cbc_assessments/{id} {
+      // Parents may read only their own linked child's assessment rows —
+      // previously any parent could read every student's CBC assessments.
+      allow read: if moduleEnabled('cbc') && (
+        isTeacherStaff() || isParentOfStudentId(fieldOrEmpty(resource.data, 'student_id'))
+      );
+      allow create, update, delete: if moduleEnabled('cbc') && (isTeacherStaff());
+    }
+    // cbc_curriculum holds school-wide competency definitions, not
+    // per-student data, so a broader parent read here is fine as-is.
+    match /cbc_curriculum/{id} {
+      allow read: if moduleEnabled('cbc') && ((isTeacherStaff() || isParent()));
+      allow create, update, delete: if moduleEnabled('cbc') && (isTeacherStaff());
+    }
+    match /cbc_schemes/{id} {
+      allow read: if moduleEnabled('cbc') && (isTeacherStaff());
+      allow create, update, delete: if moduleEnabled('cbc') && (isTeacherStaff());
+    }
+    match /cbc_lesson_plans/{id} {
+      allow read: if moduleEnabled('cbc') && (isTeacherStaff());
+      allow create, update, delete: if moduleEnabled('cbc') && (isTeacherStaff());
+    }
+
+    // ── Classwork board (Zeraki gap) ──────────────────────────
+    match /assignments/{id} {
+      allow read: if moduleEnabled('assignments') && (isSignedIn());
+      allow create, update, delete: if moduleEnabled('assignments') && (isTeacherStaff());
+    }
+
+    // ── Inventory ────────────────────────────────────────────
+    match /inventory/{id} {
+      allow read: if moduleEnabled('inventory') && ((isHead() || isBursarRole()));
+      allow create, update, delete: if moduleEnabled('inventory') && ((isHead() || isBursarRole()));
+    }
+
+    // ── Alumni ───────────────────────────────────────────────
+    match /alumni/{id} {
+      allow read: if moduleEnabled('alumni') && ((isHead() || isBursarRole()));
+      allow create, update, delete: if moduleEnabled('alumni') && (isHead());
+    }
+
+    // ── Lesson plans (Drive links) ───────────────────────────
+    match /lesson_plans/{id} {
+      allow read: if moduleEnabled('lesson_plans') && (isTeacherStaff());
+      allow create, update, delete: if moduleEnabled('lesson_plans') && (isTeacherStaff());
+    }
+
+    // ── Transport trip logs (bus left school) ────────────────
+    match /transport_trips/{id} {
+      allow read: if moduleEnabled('transport') && (isSignedIn());
+      allow create, update, delete: if moduleEnabled('transport') && (isHead() || isBursarRole() || isTeacherStaff());
+    }
+
+    // ── Internal Teacher Chat (general + private staff DMs) ───
+    // All staff may read the collection so unfiltered list/subscribe queries work
+    // (required for two-way teacher↔teacher DMs). Client still filters DMs by
+    // participants. Parent↔teacher messages live in parent_chats, not here.
+    match /teacher_chat/{id} {
+      allow read: if moduleEnabled('teacher_chat') && isStaff();
+      allow create: if moduleEnabled('teacher_chat') && isStaff()
+        && request.resource.data.author_uid == uid()
+        && (
+          // General post
+          !(('scope' in request.resource.data && request.resource.data.scope == 'dm'))
+          // DM: must include self in participants
+          || (request.resource.data.scope == 'dm'
+              && request.resource.data.participants is list
+              && uid() in request.resource.data.participants
+              && request.resource.data.participants.size() == 2)
+        );
+      allow update, delete: if moduleEnabled('teacher_chat') && (isHead() || isAdmin()
+        || isSuperAdmin()
+        || (isStaff() && resource.data.author_uid == uid()));
+    }
+
+    match /teacher_chat_presence/{id} {
+      allow read: if moduleEnabled('teacher_chat') && (isStaff());
+      allow create: if moduleEnabled('teacher_chat') && (isStaff()
+        && request.resource.data.user_uid == uid());
+      allow update: if moduleEnabled('teacher_chat') && (isStaff()
+        && (resource.data.user_uid == uid() || resource.data._presence_key == uid()
+          || isHead() || isAdmin()));
+      allow delete: if moduleEnabled('teacher_chat') && (isHead() || isAdmin()
+        || (isStaff() && (resource.data.user_uid == uid() || resource.data._presence_key == uid())));
+    }
+
+    // ── Parent ↔ teacher chat ────────────────────────────────
+    match /parent_chats/{id} {
+      allow read: if moduleEnabled('parent_chats') && (isSignedIn());
+      // Prevent a signed-in user from creating a message that impersonates
+      // another account. The client must send from_uid == request.auth.uid.
+      allow create: if moduleEnabled('parent_chats') && (isSignedIn()
+        && request.resource.data.from_uid == uid());
+      // Staff can moderate any message; authors can edit/delete their own.
+      allow update, delete: if moduleEnabled('parent_chats') && (isHead()
+        || isTeacherStaff()
+        || (isSignedIn() && resource.data.from_uid == uid()));
+    }
+    match /fcm_tokens/{id} {
+      allow read: if moduleEnabled('parent_chats') && (isSignedIn() && request.auth.uid == id);
+      allow create, update: if moduleEnabled('parent_chats') && (isSignedIn() && request.auth.uid == id);
+      allow delete: if moduleEnabled('parent_chats') && (isHead());
+    }
+
+    match /sms_queue/{id} {
+      allow read: if moduleEnabled('announcements') && (isHead());
+      allow create: if moduleEnabled('announcements') && (isSignedIn());
+      allow update, delete: if moduleEnabled('announcements') && (isHead());
+    }
+
+    match /mpesa_queue/{id} {
+      allow read: if moduleEnabled('finance') && (isHead() || isBursarRole());
+      allow create: if moduleEnabled('finance') && (isSignedIn());
+      allow update, delete: if moduleEnabled('finance') && (isHead() || isBursarRole());
+    }
+
+    // ── Audit log + online presence ─────────────────────────
+    match /audit_logs/{id} {
+      allow read: if isHead();
+      allow create: if isSignedIn();
+      // Admin/head may archive (update) or permanently delete entries
+      allow update, delete: if isHead();
+    }
+    match /user_presence/{id} {
+      allow read: if moduleEnabled('dashboard') && (isHead());
+      allow create: if moduleEnabled('dashboard') && (isSignedIn() && id == uid());
+      allow update: if moduleEnabled('dashboard') && (isSignedIn() && id == uid());
+      allow delete: if moduleEnabled('dashboard') && (isHead() || (isSignedIn() && id == uid()));
+    }
+
+    // ── Default deny + Super Admin master override ───────────────
+    // Super Admin is the system owner and must never be blocked by a
+    // collection-specific role restriction, module/tier restriction,
+    // or a forgotten Firestore collection rule. More-specific matches
+    // above still enforce restrictions for every other role.
+    match /{document=**} {
+      allow read, write: if isSuperAdmin();
+    }
+  }
+}

@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+functions/node_modules/
+
+# Env files — never commit real secrets
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+!.env.example
+
+# Build output
+dist/
+dist-ssr/
+build/
+
+# Firebase
+.firebase/
+firebase-debug.log
+firebase-debug.*.log
+*.tsbuildinfo
+
+# Vercel
+.vercel
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local key/cert material, in case anyone drops one in by hand
+*.pem
+*.key
+serviceAccountKey.json
+
+# Capacitor — the android/ project itself IS committed (that's the Capacitor
+# convention: it's your native project, not a build artifact), but its own
+# build output and local machine config are not.
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+android/app/release/
+android/captures/
+android/.cxx/
+*.keystore
+*.jks

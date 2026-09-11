@@ -1,0 +1,59 @@
+FIXES APPLIED (this pass)
+
+1. firestore.rules — deploy-breaking bug
+   canReadSchoolData() was called in 4 places (students, admissions,
+   attendance, fees) but never defined. Firestore rejects the entire
+   ruleset on deploy when a rule references an undefined function, so
+   none of those collections could be read by anyone. Added the missing
+   function: canReadSchoolData() { return isStaff() || isParent(); }
+   (matches the "view: all" intent already encoded in permissions.js).
+
+2. src/App.jsx — hard syntax error
+   Line ~204 had: pathname.replace(/\\/+$/, '')
+   The doubled backslash closes the regex literal early and leaves a
+   stray "+$/" token afterwards, which is a parse error (confirmed with
+   esbuild — the file would not build at all). Fixed to:
+   pathname.replace(/\/+$/, '')
+
+3. Eight 1KB stub pages rebuilt as real, working pages
+   Profile.jsx, Settings.jsx, Students.jsx, Transport.jsx,
+   StaffPortal.jsx, UserControl.jsx, SystemHealth.jsx, StudentPortal.jsx
+   had all been replaced with placeholder <MissingModule /> components
+   (the previous "fixed" package didn't include the real files). Each
+   was rebuilt following this codebase's existing conventions
+   (lib/sync.js CRUD helpers, DialogContext toasts/confirms,
+   lib/permissions.js role gating, ResponsiveTable/EmptyState/Skeleton
+   components, CLASS_LIST/ROLES from lib/roles.js):
+
+   - Profile: avatar upload+compress, edit name/phone, change password
+   - Settings: school_settings form (name, motto, address, term/year)
+   - Students (route /admission): full roster CRUD, search/filter by
+     class + status, Excel import/export, admission-number dedup,
+     syncs studentInvites index for first-time student portal setup
+   - Transport: routes CRUD + student-to-route assignment tabs
+   - StaffPortal: teacher/class_teacher dashboard, permission-gated
+     quick-link cards to Attendance, Exam Entry, CBC, Timetable, etc.
+   - UserControl: staff directory, role changes, password reset via
+     adminSetUserPassword callable, account provisioning
+     (admin/super_admin gated, respects canManageAdmins)
+   - SystemHealth: live diagnostics — connectivity, Firestore reachability,
+     app lock state, plan tier/grace period, per-collection record counts
+   - StudentPortal: student's own profile + Learning Hub/Assignments
+     links (self view), or a read-only student lookup (staff oversight
+     view for admin/headteacher/super_admin)
+
+VERIFICATION
+- Every .js/.jsx file in the package parsed cleanly with esbuild
+  (0 syntax errors) after the App.jsx fix.
+- Every local relative import (`from './x'`, `import('./x')`) across
+  the whole src/ tree resolves to a real file on disk (0 missing).
+- Field names used in the new pages (parent_email/parent_phone/
+  parent_name, class_name, admission_number/adm_no, etc.) were
+  cross-checked against Fees.jsx, ParentHome.jsx, Admissions.jsx and
+  ClassManagement.jsx for consistency.
+
+NOT RUN
+- Full Vite/npm build: the archive still has no package.json, so its
+  real dependency set (react-bootstrap, fontawesome, xlsx, firebase,
+  etc.) can't be installed/built in isolation from this zip alone.
+  Syntax/import checks above are the closest available substitute.

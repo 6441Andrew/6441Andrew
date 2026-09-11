@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      width=device-width + initial-scale=1 is what stops mobile browsers from
+      first laying the page out at a wide "desktop" viewport and then
+      snapping down to the real portrait width a beat later — the most
+      common cause of a visible landscape→portrait flash on load, on top of
+      manifest.json's "orientation": "portrait" below (which additionally
+      locks orientation for the installed/standalone PWA before any JS runs).
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#1e3a5f" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)" />
+    <meta name="description" content="Wonderland Academy — Parent & Staff Portal" />
+
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+
+    <!--
+      Runs before main.jsx (a deferred module script) so the saved
+      theme + orientation lock apply as early as possible. main.jsx still
+      has its own inline theme try-block for the same purpose — see the
+      note in docs/CAPACITOR_SETUP.md about that overlap.
+    -->
+    <script src="/theme-init.js"></script>
+
+    <title>Wonderland Academy</title>
+
+    <!--
+      Critical, inlined splash styling only — everything else lives in
+      src/index.css, which hasn't loaded yet at this point. Keeps first
+      paint branded instead of a blank white flash while the bundle loads.
+      main.jsx toggles `.is-hidden` on #wa-boot-splash once React has
+      painted, then removes the node — see main.jsx for that handoff.
+    -->
+    <style>
+      html, body { margin: 0; padding: 0; }
+      #wa-boot-splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+        background: #f7f4ef;
+        color: #1e3a5f;
+        font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+        z-index: 9999;
+        transition: opacity 0.35s ease;
+        opacity: 1;
+      }
+      #wa-boot-splash.is-hidden { opacity: 0; pointer-events: none; }
+      #wa-boot-splash img { width: 96px; height: 96px; object-fit: contain; border-radius: 12px; }
+      #wa-boot-splash span { font-size: 0.95rem; opacity: 0.75; }
+      @media (prefers-color-scheme: dark) {
+        #wa-boot-splash { background: #0b1220; color: #e8eef7; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="wa-boot-splash" aria-hidden="true">
+      <img src="/wonderland-logo.jpg" alt="" />
+      <span>Wonderland Academy</span>
+    </div>
+
+    <div id="root"></div>
+    <noscript>Please enable JavaScript to use Wonderland Academy.</noscript>
+
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
